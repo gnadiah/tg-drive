@@ -1,0 +1,8 @@
+# Core dependencies
+telethon>=1.36.0
+pywebview[winforms]>=5.0.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# Build tool
+pyinstaller>=6.0.0

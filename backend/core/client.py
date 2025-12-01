@@ -3,12 +3,28 @@ from telethon.errors import SessionPasswordNeededError
 import os
 import logging
 from dotenv import load_dotenv
+from pathlib import Path
 
 load_dotenv()
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
-SESSION_NAME = "telegram_drive_session"
+
+# Store session in user's AppData directory for better compatibility
+def get_session_path():
+    """Get the session file path in user's AppData/Local directory"""
+    if os.name == 'nt':  # Windows
+        app_data = os.getenv('LOCALAPPDATA')
+        session_dir = os.path.join(app_data, 'TelegramDrive')
+    else:  # Linux/Mac
+        home = str(Path.home())
+        session_dir = os.path.join(home, '.telegram-drive')
+    
+    # Create directory if it doesn't exist
+    os.makedirs(session_dir, exist_ok=True)
+    return os.path.join(session_dir, 'telegram_drive_session')
+
+SESSION_NAME = get_session_path()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -105,7 +121,7 @@ class TGClient:
         if not self.client:
              await self.start()
         
-        from .parallel_uploader import ParallelUploader
+        from backend.core.parallel_uploader import ParallelUploader
         
         logger.info(f"Uploading file using ParallelUploader: {file_path}")
         

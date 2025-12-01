@@ -2,8 +2,20 @@ import webview
 import sys
 import os
 import threading
+
+# Determine if running in PyInstaller bundle
+def get_base_path():
+    """Get the base path - works for both dev and PyInstaller bundle"""
+    if getattr(sys, 'frozen', False):
+        # Running in PyInstaller bundle
+        return sys._MEIPASS
+    else:
+        # Running in normal Python environment
+        return os.path.dirname(os.path.abspath(__file__))
+
 # Add backend to path so imports work
-sys.path.append(os.path.join(os.path.dirname(__file__), 'backend'))
+base_path = get_base_path()
+sys.path.append(os.path.join(base_path, 'backend'))
 
 from backend.bridge import Bridge
 
@@ -13,7 +25,8 @@ def start_webview():
     print("App: Bridge initialized")
     
     # Point to built frontend
-    url = os.path.join(os.path.dirname(__file__), 'frontend', 'dist', 'index.html')
+    base_path = get_base_path()
+    url = os.path.join(base_path, 'frontend', 'dist', 'index.html')
     
     # Optional: Check for dev mode argument if needed, but user requested built integration
     if len(sys.argv) > 1 and sys.argv[1] == '--dev':

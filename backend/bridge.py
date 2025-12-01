@@ -2,9 +2,9 @@ import asyncio
 import os
 import threading
 import webview
-from core.client import tg_client
-from core.file_manager import split_file, get_file_hash, merge_files
-from core.metadata_manager import FileMetadata, FileChunk, MetadataManager
+from backend.core.client import tg_client
+from backend.core.file_manager import split_file, get_file_hash, merge_files
+from backend.core.metadata_manager import FileMetadata, FileChunk, MetadataManager
 import uuid
 import shutil
 import time
@@ -338,7 +338,7 @@ class Bridge:
             file_hash = get_file_hash(file_path)
             
             chunk_gen = split_file(file_path)
-            from core.file_manager import CHUNK_SIZE
+            from backend.core.file_manager import CHUNK_SIZE
             total_chunks = (file_size // CHUNK_SIZE) + 1
             
             tracker = self.TransferTracker(file_size, file_id, self._window, is_upload=True)
