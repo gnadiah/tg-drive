@@ -111,12 +111,14 @@ class ParallelUploader:
             size = min(part_size, file_size - offset)
             await queue.put((i, offset, size))
         
-        # Track progress
+        # Track progress and retries
         uploaded_bytes = 0
         progress_lock = asyncio.Lock()
-        errors = []
+        final_errors = [] # Only store errors that exceeded max retries
+        retry_counts = {} # part_index -> count
+        MAX_RETRIES = 5
         
-        async def upload_worker():
+        async def upload_worker(worker_id):
             """Worker task to upload parts from queue"""
             nonlocal uploaded_bytes
             
@@ -127,6 +129,8 @@ class ParallelUploader:
                     break
                 
                 try:
+                    logger.info(f"[Worker {worker_id}] Starting part {part_index}/{part_count} ({size} bytes)")
+                    
                     # Read part from file
                     with open(file_path, 'rb') as f:
                         f.seek(offset)
@@ -154,29 +158,33 @@ class ParallelUploader:
                             # Call with (current, total) for compatibility with TransferTracker
                             progress_callback(uploaded_bytes, file_size)
                     
-                    logger.debug(f"Part {part_index}/{part_count} uploaded ({len(bytes_data)} bytes)")
+                    logger.info(f"[Worker {worker_id}] Finished part {part_index}/{part_count}")
                     
                 except Exception as e:
-                    logger.error(f"Failed to upload part {part_index}: {e}")
-                    errors.append((part_index, e))
-                    # Put back in queue for retry
-                    await queue.put((part_index, offset, size))
+                    current_retries = retry_counts.get(part_index, 0)
+                    if current_retries < MAX_RETRIES:
+                        retry_counts[part_index] = current_retries + 1
+                        logger.warning(f"[Worker {worker_id}] Failed part {part_index} (Attempt {current_retries+1}/{MAX_RETRIES}): {e}. Retrying...")
+                        await queue.put((part_index, offset, size))
+                    else:
+                        logger.error(f"[Worker {worker_id}] Failed part {part_index} after {MAX_RETRIES} attempts: {e}")
+                        final_errors.append((part_index, e))
                     
                 finally:
                     queue.task_done()
         
         # Create and run workers
         workers_tasks = [
-            asyncio.create_task(upload_worker())
-            for _ in range(min(self.workers, part_count))
+            asyncio.create_task(upload_worker(i))
+            for i in range(min(self.workers, part_count))
         ]
         
         # Wait for all workers
         await asyncio.gather(*workers_tasks)
         
         # Check for errors
-        if errors:
-            raise Exception(f"Upload failed for {len(errors)} parts: {errors[0][1]}")
+        if final_errors:
+            raise Exception(f"Upload failed for {len(final_errors)} parts. First error: {final_errors[0][1]}")
         
         logger.info(f"Upload complete: {file_name} ({file_size} bytes)")
         

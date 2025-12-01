@@ -1,21 +1,21 @@
 import asyncio
-import os
 import threading
-import webview
-from backend.core.client import tg_client
-from backend.core.file_manager import split_file, get_file_hash, merge_files
-from backend.core.metadata_manager import FileMetadata, FileChunk, MetadataManager
-import uuid
-import shutil
-import time
+from backend.core import tg_client
+from backend.api import AuthHandler, FileHandler, PasscodeHandler
 
 class Bridge:
     def __init__(self):
         self._window = None
-        # Passcode rate limiting
+        # Passcode rate limiting (state kept here for shared access)
         self._failed_passcode_attempts = 0
         self._passcode_lockout_until = None
         self._session_passcode = None
+        
+        # Initialize Handlers
+        self.auth = AuthHandler(self)
+        self.files = FileHandler(self)
+        self.passcode = PasscodeHandler(self)
+        
         # Start a background event loop
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=self._start_loop, daemon=True)
@@ -44,765 +44,74 @@ class Bridge:
 
     def _run_async(self, coro):
         """Run a coroutine on the background loop and return the result."""
-        # print(f"Bridge: Dispatching {coro.__name__} to background loop")
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
         try:
             res = future.result()
-            # print(f"Bridge: {coro.__name__} completed")
             return res
         except Exception as e:
             print(f"Bridge: {coro.__name__} failed: {e}")
-            # Unwrap exception if possible or just raise
             raise e
 
     async def _ensure_client(self):
         if not tg_client.client or not tg_client.client.is_connected():
             await tg_client.start()
 
-    # --- Authentication ---
+    # --- Authentication (Delegated) ---
 
     def check_auth(self):
-        async def _check():
-            print("Bridge: check_auth called")
-            await self._ensure_client()
-            is_auth = await tg_client.is_user_authorized()
-            print(f"Bridge: is_user_authorized={is_auth}")
-            
-            user_data = None
-            
-            # Try to fetch user even if is_auth is False, just to be sure/refresh
-            try:
-                me = await tg_client.get_me()
-                if me:
-                    print(f"Bridge: get_me() success! User: {me.id}")
-                    is_auth = True
-                    user_data = {
-                        "id": me.id,
-                        "first_name": me.first_name,
-                        "last_name": me.last_name,
-                        "username": me.username,
-                        "phone": me.phone
-                    }
-            except Exception as e:
-                print(f"Bridge: get_me() failed (expected if not auth): {e}")
-
-            return {"authenticated": is_auth, "user": user_data}
-        
-        return self._run_async(_check())
+        return self._run_async(self.auth.check_auth())
 
     def request_code(self, phone):
-        async def _req():
-            await self._ensure_client()
-            await tg_client.send_code_request(phone)
-            return {"success": True}
-        
-        try:
-            return self._run_async(_req())
-        except Exception as e:
-            raise e
+        return self._run_async(self.auth.request_code(phone))
 
     def sign_in(self, phone, code, password=None):
-        async def _sign_in():
-            print(f"TGClient: sign_in called for {phone} (password={'YES' if password else 'NO'})")
-            await self._ensure_client()
-            try:
-                await tg_client.sign_in(phone, code, password)
-                return {"success": True}
-            except Exception as e:
-                print(f"TGClient: sign_in exception: {type(e).__name__}: {e}")
-                if "SessionPasswordNeededError" in str(type(e).__name__):
-                     return {"status": "needs_password"}
-                return {"error": str(e)}
-        
-        return self._run_async(_sign_in())
+        return self._run_async(self.auth.sign_in(phone, code, password))
 
     def logout(self):
-        async def _logout():
-            try:
-                print("Bridge: logout() called")
-                await self._ensure_client()
-                await tg_client.log_out()
-                
-                # Clear QR state
-                if hasattr(self, '_current_qr'): del self._current_qr
-                if hasattr(self, '_qr_status'): del self._qr_status
-                if hasattr(self, '_qr_created_at'): del self._qr_created_at
-                if hasattr(self, '_qr_error'): del self._qr_error
-                if hasattr(self, '_qr_needs_password'): del self._qr_needs_password
-                
-                # Clear Passcode state
-                if hasattr(self, '_session_passcode'): del self._session_passcode
-                self._failed_passcode_attempts = 0
-                self._passcode_lockout_until = None
-                
-                print("Bridge: logout successful")
-                return {"success": True}
-            except Exception as e:
-                print(f"Bridge: logout error: {type(e).__name__}: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
-        
-        try:
-            return self._run_async(_logout())
-        except Exception as e:
-            print(f"Bridge: _run_async(logout) failed: {e}")
-            raise
+        return self._run_async(self.auth.logout())
 
     def log(self, message):
-        """Log message from JS."""
         print(f"JS_LOG: {message}")
 
-    # --- Passcode Management ---
+    # --- Passcode Management (Delegated) ---
     
     def has_passcode(self):
-        """Check if passcode exists on Telegram."""
-        async def _has():
-            await self._ensure_client()
-            from backend.core.passcode_manager import has_passcode_on_telegram
-            return {"has_passcode": await has_passcode_on_telegram(tg_client.client)}
-        return self._run_async(_has())
+        return self._run_async(self.passcode.has_passcode())
     
     def set_passcode(self, passcode):
-        """
-        Set new passcode (first time setup).
-        Encrypts passcode with itself and stores on Telegram.
-        """
-        async def _set():
-            await self._ensure_client()
-            from backend.core.passcode_manager import set_passcode_on_telegram
-            from backend.core.crypto_utils import validate_passcode
-            
-            if not validate_passcode(passcode):
-                return {"success": False, "error": "Passcode must be exactly 6 digits"}
-            
-            try:
-                await set_passcode_on_telegram(tg_client.client, passcode)
-                # Cache in session for immediate use
-                self._session_passcode = passcode
-                return {"success": True}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
-        return self._run_async(_set())
+        return self._run_async(self.passcode.set_passcode(passcode))
     
     def verify_passcode(self, passcode):
-        """
-        Verify passcode with rate limiting (5 attempts, 30s lockout).
-        """
-        # Check if locked out
-        if self._passcode_lockout_until and time.time() < self._passcode_lockout_until:
-            retry_after = int(self._passcode_lockout_until - time.time())
-            return {
-                "valid": False,
-                "error": "locked_out",
-                "message": f"Too many failed attempts. Try again in {retry_after}s",
-                "retry_after": retry_after
-            }
-        
-        async def _verify():
-            await self._ensure_client()
-            from backend.core.passcode_manager import verify_passcode_from_telegram
-            
-            valid = await verify_passcode_from_telegram(tg_client.client, passcode)
-            
-            if valid:
-                # Success - reset attempts and cache passcode
-                self._failed_passcode_attempts = 0
-                self._passcode_lockout_until = None
-                self._session_passcode = passcode
-                return {"valid": True}
-            else:
-                # Failed - increment attempts
-                self._failed_passcode_attempts += 1
-                attempts_remaining = 5 - self._failed_passcode_attempts
-                
-                if self._failed_passcode_attempts >= 5:
-                    # Lock out for 30 seconds
-                    self._passcode_lockout_until = time.time() + 30
-                    return {
-                        "valid": False,
-                        "error": "too_many_attempts",
-                        "message": "Too many failed attempts. Locked for 30 seconds",
-                        "locked_for": 30,
-                        "attempts_remaining": 0
-                    }
-                else:
-                    return {
-                        "valid": False,
-                        "error": "incorrect",
-                        "message": f"Incorrect passcode. {attempts_remaining} attempts remaining",
-                        "attempts_remaining": attempts_remaining
-                    }
-        
-        return self._run_async(_verify())
+        return self._run_async(self.passcode.verify_passcode(passcode))
     
     def change_passcode(self, old_passcode, new_passcode):
-        """Change passcode after verifying old one."""
-        async def _change():
-            await self._ensure_client()
-            from backend.core.passcode_manager import change_passcode_on_telegram
-            from backend.core.crypto_utils import validate_passcode
-            if not validate_passcode(new_passcode):
-                return {"error": "New passcode must be exactly 6 digits"}
-            
-            try:
-                success = await change_passcode_on_telegram(tg_client.client, old_passcode, new_passcode)
-                if success:
-                    # Update session cache
-                    self._session_passcode = new_passcode
-                    
-                    # Re-encrypt all V2 metadata messages
-                    try:
-                        from backend.core.metadata_manager import MetadataManager
-                        print("Bridge: Starting metadata re-encryption...")
-                        count = 0
-                        async for msg in tg_client.client.iter_messages("me"):
-                            if msg.text and msg.text.startswith("METADATA_V2_ENCRYPTED"):
-                                try:
-                                    encrypted_str = msg.text.split("\n", 1)[1]
-                                    # Decrypt with OLD passcode
-                                    metadata = MetadataManager.from_json_encrypted(encrypted_str, old_passcode)
-                                    
-                                    # Re-encrypt with NEW passcode
-                                    new_content = MetadataManager.to_json_encrypted(metadata, new_passcode)
-                                    
-                                    # Edit message
-                                    await msg.edit(f"METADATA_V2_ENCRYPTED\n{new_content}")
-                                    count += 1
-                                except Exception as e:
-                                    print(f"Bridge: Failed to re-encrypt message {msg.id}: {e}")
-                        print(f"Bridge: Re-encryption complete. Processed {count} files.")
-                    except Exception as e:
-                        print(f"Bridge: Critical error during re-encryption: {e}")
-                    
-                    return {"success": True}
-                else:
-                    return {"error": "Incorrect old passcode"}
-            except ValueError as e:
-                return {"error": str(e)}
-        return self._run_async(_change())
+        return self._run_async(self.passcode.change_passcode(old_passcode, new_passcode))
     
     def reset_encryption(self):
-        """
-        NUCLEAR OPTION: Delete all encrypted data and start fresh.
-        Deletes: passcode hash + all V2 encrypted metadata
-        Keeps: V1 plaintext metadata
-        """
-        async def _reset():
-            await self._ensure_client()
-            from backend.core.passcode_manager import reset_all_encrypted_data
-            result = await reset_all_encrypted_data(tg_client.client)
-            
-            # Clear session cache and rate limiting
-            if hasattr(self, '_session_passcode'):
-                del self._session_passcode
-            self._failed_passcode_attempts = 0
-            self._passcode_lockout_until = None
-            
-            return {
-                "success": True,
-                "passcode_deleted": result["passcode_deleted"],
-                "encrypted_files_deleted": result["encrypted_files_deleted"]
-            }
-        return self._run_async(_reset())
+        return self._run_async(self.passcode.reset_encryption())
 
-    # --- QR Login ---
+    # --- QR Login (Delegated) ---
     
     def request_qr(self):
-        async def _req_qr():
-            await self._ensure_client()
-            
-            # Reuse existing QR if valid (created < 25s ago)
-            if hasattr(self, '_current_qr') and hasattr(self, '_qr_created_at'):
-                if time.time() - self._qr_created_at < 25:
-                    print("Bridge: Reusing existing QR request")
-                    qr = self._current_qr
-                    return {
-                        "qr_url": qr.url,
-                        "token_id": qr.token.hex() if isinstance(qr.token, bytes) else str(qr.token),
-                        "expires_in": 30
-                    }
-
-            print("Bridge: Calling qr_login_start...")
-            qr = await tg_client.qr_login_start()
-            print(f"Bridge: qr_login_start returned type={type(qr)}")
-            
-            self._current_qr = qr
-            self._qr_created_at = time.time()
-            self._qr_status = "waiting"
-            self._qr_error = None
-            self._qr_needs_password = False
-            
-            # Start background monitor
-            asyncio.create_task(self._monitor_qr(qr))
-            
-            try:
-                url = qr.url
-                print(f"Bridge: qr.url={url}")
-            except Exception as e:
-                print(f"Bridge: qr.url access failed: {e}")
-                raise e
-
-            return {
-                "qr_url": url,
-                "token_id": qr.token.hex() if isinstance(qr.token, bytes) else str(qr.token),
-                "expires_in": 30
-            }
-        return self._run_async(_req_qr())
-
-    async def _monitor_qr(self, qr):
-        """Background task to monitor QR status"""
-        print("Bridge: Starting QR monitor task")
-        try:
-            # Wait for QR scan (long timeout)
-            user = await qr.wait(timeout=60)
-            print(f"Bridge: QR scan confirmed! User: {user}")
-            self._qr_status = "confirmed"
-            
-        except Exception as e:
-            error_name = type(e).__name__
-            print(f"Bridge: QR monitor exception: {error_name}: {e}")
-            
-            if "SessionPasswordNeededError" in error_name:
-                print("Bridge: QR Login successful (needs 2FA)")
-                self._qr_status = "confirmed"
-                self._qr_needs_password = True
-            elif "TimeoutError" in error_name:
-                self._qr_status = "expired"
-            elif "already" in str(e).lower() or "authorized" in str(e).lower():
-                print("Bridge: Already authorized")
-                self._qr_status = "confirmed"
-            else:
-                self._qr_status = "error"
-                self._qr_error = str(e)
+        return self._run_async(self.auth.request_qr())
 
     def check_qr_status(self, token_id):
-        async def _check():
-            if not hasattr(self, '_current_qr'):
-                return {"status": "expired"}
-            
-            # Return cached status from monitor
-            status = getattr(self, '_qr_status', 'waiting')
-            
-            if status == "confirmed":
-                result = {"status": "confirmed"}
-                if getattr(self, '_qr_needs_password', False):
-                    result["needs_password"] = True
-                return result
-            
-            elif status == "error":
-                return {"status": "error", "error": getattr(self, '_qr_error', 'Unknown error')}
-            
-            elif status == "expired":
-                return {"status": "expired"}
-                
-            # Fallback: Check auth state directly if still waiting
-            if status == "waiting":
-                try:
-                    if await tg_client.is_user_authorized():
-                        print("QR: User is authorized (fallback check)!")
-                        self._qr_status = "confirmed"
-                        return {"status": "confirmed"}
-                except:
-                    pass
-            
-            return {"status": "waiting"}
-        
-        return self._run_async(_check())
+        return self._run_async(self.auth.check_qr_status(token_id))
 
-    # --- Files ---
-
-    # --- Helper ---
-    class TransferTracker:
-        def __init__(self, total_size, file_id, window, is_upload=True):
-            self.total_size = total_size
-            self.file_id = file_id
-            self.window = window
-            self.is_upload = is_upload
-            self.start_time = time.time()
-            self.chunk_progress = {} # chunk_index -> bytes_transferred
-            self.last_update_time = 0
-            self.lock = threading.Lock()
-
-        def update(self, chunk_index, current, total):
-            with self.lock:
-                self.chunk_progress[chunk_index] = current
-                
-                now = time.time()
-                if now - self.last_update_time < 0.1: # Limit updates to 100ms
-                    return
-
-                self.last_update_time = now
-                
-                total_transferred = sum(self.chunk_progress.values())
-                progress = int((total_transferred / self.total_size) * 100)
-                
-                duration = now - self.start_time
-                if duration < 0.1: duration = 0.1
-                speed = total_transferred / duration
-                
-                if speed > 1024 * 1024:
-                    speed_str = f"{speed / (1024 * 1024):.1f} MB/s"
-                elif speed > 1024:
-                    speed_str = f"{speed / 1024:.1f} KB/s"
-                else:
-                    speed_str = f"{speed:.0f} B/s"
-                
-                method = "onUploadProgress" if self.is_upload else "onDownloadProgress"
-                try:
-                    self.window.evaluate_js(f"window.{method}('{self.file_id}', {progress}, '{speed_str}', 'Transferring...')")
-                except:
-                    pass
-
-    # --- Files ---
+    # --- Files (Delegated) ---
 
     def list_files(self):
-        async def _list():
-            await self._ensure_client()
-            messages = await tg_client.get_messages(limit=100)
-            files = []
-            # Get active passcode
-            passcode = getattr(self, '_session_passcode', None)
-            
-            for msg in messages:
-                if not msg.text: continue
-                
-                try:
-                    metadata = None
-                    
-                    # Handle V1 (Plaintext)
-                    if msg.text.startswith("METADATA_V1"):
-                        json_str = msg.text.split("\n", 1)[1]
-                        metadata = MetadataManager.from_json(json_str)
-                        
-                    # Handle V2 (Encrypted)
-                    elif msg.text.startswith("METADATA_V2_ENCRYPTED"):
-                        if passcode:
-                            try:
-                                encrypted_str = msg.text.split("\n", 1)[1]
-                                metadata = MetadataManager.from_json_encrypted(encrypted_str, passcode)
-                            except Exception as e:
-                                print(f"Bridge: Failed to decrypt file {msg.id}: {e}")
-                                continue
-                        else:
-                            # Cannot decrypt without passcode
-                            continue
-                    
-                    if metadata:
-                        file_data = metadata.model_dump()
-                        file_data["metadata_message_id"] = msg.id
-                        files.append(file_data)
-                        
-                except Exception as e:
-                    print(f"Bridge: Error parsing message {msg.id}: {e}")
-                    continue
-            return files
-        return self._run_async(_list())
+        return self._run_async(self.files.list_files())
 
     def pick_and_upload_file(self):
-        file_types = ('All files (*.*)',)
-        # Handle window as list  
-        window = self._window[0] if isinstance(self._window, list) else self._window
-        result = window.create_file_dialog(
-            webview.FileDialog.OPEN,
-            allow_multiple=False,
-            file_types=file_types
-        )
-        
-        if result:
-            file_path = result[0]
-            # Use run_coroutine_threadsafe directly for fire-and-forget background task
-            asyncio.run_coroutine_threadsafe(self._upload_logic(file_path), self.loop)
-            return {"status": "started", "file": os.path.basename(file_path)}
-        return {"status": "cancelled"}
-
-    async def _upload_logic(self, file_path):
-        file_id = str(uuid.uuid4())
-        try:
-            await self._ensure_client()
-            filename = os.path.basename(file_path)
-            file_size = os.path.getsize(file_path)
-            
-            try:
-                self._window.evaluate_js(f"window.onUploadProgress('{file_id}', 0, '0 B/s', 'Starting...')")
-            except Exception as e:
-                print(f"Bridge: [Upload] Failed to init UI: {e}")
-
-            file_hash = get_file_hash(file_path)
-            
-            chunk_gen = split_file(file_path)
-            from backend.core.file_manager import CHUNK_SIZE
-            total_chunks = (file_size // CHUNK_SIZE) + 1
-            
-            tracker = self.TransferTracker(file_size, file_id, self._window, is_upload=True)
-            
-            # Concurrency control
-            active_tasks = set()
-            chunks_metadata = []
-            
-            async def upload_worker(index, chunk_data):
-                print(f"Bridge: [Upload] Starting chunk {index}/{total_chunks} ({len(chunk_data)} bytes)")
-                
-                # Use temp dir
-                temp_dir = "temp_uploads"
-                os.makedirs(temp_dir, exist_ok=True)
-                chunk_temp_path = os.path.join(temp_dir, f"{file_id}_part{index}")
-
-                with open(chunk_temp_path, "wb") as f:
-                    f.write(chunk_data)
-                
-                chunk_hash = get_file_hash(chunk_temp_path)
-                
-                def progress_callback(current, total):
-                    tracker.update(index, current, total)
-
-                # Upload
-                passcode = getattr(self, '_session_passcode', None)
-                caption = "#ENCRYPTED_CHUNK" if passcode else "#TG_DRIVE_CHUNK"
-                message = await tg_client.upload_file(
-                    chunk_temp_path, 
-                    caption=caption,
-                    progress_callback=progress_callback
-                )
-                print(f"Bridge: [Upload] Chunk {index} uploaded. Message ID: {message.id}")
-                
-                # Cleanup
-                os.remove(chunk_temp_path)
-                
-                return FileChunk(
-                    index=index,
-                    message_id=message.id,
-                    size=len(chunk_data),
-                    hash=chunk_hash
-                )
-
-            # Producer-Consumer loop to limit memory usage
-            for index, chunk_data in chunk_gen:
-                if len(active_tasks) >= 5: # Limit to 5 concurrent uploads
-                    done, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
-                    for t in done:
-                        chunks_metadata.append(await t)
-                
-                task = asyncio.create_task(upload_worker(index, chunk_data))
-                active_tasks.add(task)
-            
-            # Wait for remaining
-            if active_tasks:
-                done, _ = await asyncio.wait(active_tasks)
-                for t in done:
-                    chunks_metadata.append(await t)
-
-            metadata = FileMetadata(
-                id=file_id,
-                name=filename,
-                size=file_size,
-                chunks=chunks_metadata,
-                hash=file_hash,
-                mime_type="application/octet-stream"
-            )
-            
-            # Check for active passcode in session
-            passcode = getattr(self, '_session_passcode', None)
-            
-            if passcode:
-                # Encrypt metadata (V2)
-                metadata_encrypted = MetadataManager.to_json_encrypted(metadata, passcode)
-                await tg_client.send_message(f"METADATA_V2_ENCRYPTED\n{metadata_encrypted}")
-                print(f"Bridge: [Upload] Encrypted metadata (V2) sent.")
-            else:
-                # Plaintext metadata (V1)
-                metadata_json = MetadataManager.to_json(metadata)
-                await tg_client.send_message(f"METADATA_V1\n{metadata_json}")
-                print(f"Bridge: [Upload] Plaintext metadata (V1) sent.")
-            
-            self._window.evaluate_js(f"window.onUploadComplete('{file_id}')")
-            
-        except Exception as e:
-            print(f"Upload error: {e}")
-            self._window.evaluate_js(f"window.onUploadError('{file_id}', '{str(e)}')")
+        # This one is synchronous wrapper around async logic inside handler
+        return self.files.pick_and_upload_file()
 
     def download_file(self, file_id):
-        # Fire and forget download logic
-        asyncio.run_coroutine_threadsafe(self._download_logic(file_id), self.loop)
-        return {"status": "started"}
-
-    async def _download_logic(self, file_id):
-        try:
-            await self._ensure_client()
-            
-            messages = await tg_client.get_messages(limit=100)
-            metadata = None
-            passcode = getattr(self, '_session_passcode', None)
-            
-            for msg in messages:
-                if not msg.text: continue
-                
-                try:
-                    # Handle V1
-                    if msg.text.startswith("METADATA_V1"):
-                        json_str = msg.text.split("\n", 1)[1]
-                        m = MetadataManager.from_json(json_str)
-                        if m.id == file_id:
-                            metadata = m
-                            break
-                            
-                    # Handle V2
-                    elif msg.text.startswith("METADATA_V2_ENCRYPTED"):
-                        if passcode:
-                            try:
-                                encrypted_str = msg.text.split("\n", 1)[1]
-                                m = MetadataManager.from_json_encrypted(encrypted_str, passcode)
-                                if m.id == file_id:
-                                    metadata = m
-                                    break
-                            except: continue
-                except: continue
-            
-            if not metadata:
-                self._window.evaluate_js(f"window.onDownloadError('{file_id}', 'File not found')")
-                return
-
-            # Handle window as list
-            window = self._window[0] if isinstance(self._window, list) else self._window
-            save_path = window.create_file_dialog(
-                webview.FileDialog.SAVE,
-                save_filename=metadata.name
-            )
-            
-            if not save_path:
-                return
-
-            save_path = save_path if isinstance(save_path, str) else save_path[0]
-
-            temp_dir = f"temp_download_{file_id}"
-            os.makedirs(temp_dir, exist_ok=True)
-            
-            sorted_chunks = sorted(metadata.chunks, key=lambda c: c.index)
-            total = len(sorted_chunks)
-            total_size = metadata.size
-            
-            tracker = self.TransferTracker(total_size, file_id, self._window, is_upload=False)
-            
-            sem = asyncio.Semaphore(5) # Limit concurrent downloads
-            
-            chunk_paths = [None] * total # Pre-allocate to store in order
-
-            async def download_worker(i, chunk):
-                async with sem:
-                    print(f"Bridge: [Download] Starting chunk {i}/{total}")
-                    chunk_msg = await tg_client.get_message_by_id(chunk.message_id)
-                    if not chunk_msg:
-                        raise Exception(f"Chunk {chunk.index} missing")
-                    
-                    chunk_path = os.path.join(temp_dir, f"chunk_{chunk.index}")
-                    
-                    def progress_callback(current, total):
-                        tracker.update(i, current, total)
-
-                    await tg_client.download_media(
-                        chunk_msg[0], 
-                        chunk_path,
-                        progress_callback=progress_callback
-                    )
-                    
-                    if get_file_hash(chunk_path) != chunk.hash:
-                        raise Exception(f"Chunk {chunk.index} hash mismatch")
-                    
-                    print(f"Bridge: [Download] Chunk {i} done.")
-                    return i, chunk_path
-
-            tasks = [download_worker(i, chunk) for i, chunk in enumerate(sorted_chunks)]
-            results = await asyncio.gather(*tasks)
-            
-            # Sort results just in case, though gather preserves order
-            for i, path in results:
-                chunk_paths[i] = path
-
-            print("Bridge: [Download] Merging files...")
-            self._window.evaluate_js(f"window.onDownloadProgress('{file_id}', 99, '0 B/s', 'Merging...')")
-            merge_files(chunk_paths, save_path)
-            
-            # Verify final file integrity
-            print("Bridge: [Download] Verifying integrity...")
-            final_hash = get_file_hash(save_path)
-            if final_hash != metadata.hash:
-                shutil.rmtree(temp_dir)
-                if os.path.exists(save_path):
-                    os.remove(save_path)
-                raise Exception(f"File integrity check failed! Expected {metadata.hash[:16]}..., got {final_hash[:16]}...")
-            
-            print(f"Bridge: [Download] Integrity verified: {final_hash[:16]}...")
-            
-            shutil.rmtree(temp_dir)
-            
-            print("Bridge: [Download] Complete.")
-            self._window.evaluate_js(f"window.onDownloadComplete('{file_id}')")
-
-        except Exception as e:
-            print(f"Download error: {e}")
-            self._window.evaluate_js(f"window.onDownloadError('{file_id}', '{str(e)}')")
+        return self.files.download_file(file_id)
 
     def rename_file(self, file_id, new_name, metadata_message_id):
-        async def _rename():
-            await self._ensure_client()
-            msgs = await tg_client.get_message_by_id(metadata_message_id)
-            if not msgs: return {"error": "Message not found"}
-            msg = msgs[0]
-            passcode = getattr(self, '_session_passcode', None)
-            
-            metadata = None
-            is_encrypted = False
-            
-            if msg.text.startswith("METADATA_V1"):
-                json_str = msg.text.split("\n", 1)[1]
-                metadata = MetadataManager.from_json(json_str)
-            elif msg.text.startswith("METADATA_V2_ENCRYPTED"):
-                if not passcode: return {"error": "Passcode required"}
-                try:
-                    encrypted_str = msg.text.split("\n", 1)[1]
-                    metadata = MetadataManager.from_json_encrypted(encrypted_str, passcode)
-                    is_encrypted = True
-                except: return {"error": "Decryption failed"}
-            
-            if not metadata: return {"error": "Invalid metadata"}
-            if metadata.id != file_id: return {"error": "ID mismatch"}
-            
-            metadata.name = new_name
-            
-            if is_encrypted:
-                new_content = MetadataManager.to_json_encrypted(metadata, passcode)
-                await tg_client.edit_message(metadata_message_id, f"METADATA_V2_ENCRYPTED\n{new_content}")
-            else:
-                new_json = MetadataManager.to_json(metadata)
-                await tg_client.edit_message(metadata_message_id, f"METADATA_V1\n{new_json}")
-            
-            return {"success": True}
-        return self._run_async(_rename())
+        return self.files.rename_file(file_id, new_name, metadata_message_id)
 
     def delete_file(self, file_id, metadata_message_id):
-        async def _delete():
-            await self._ensure_client()
-            msgs = await tg_client.get_message_by_id(metadata_message_id)
-            if not msgs: return {"error": "Message not found"}
-            msg = msgs[0]
-            passcode = getattr(self, '_session_passcode', None)
-            
-            metadata = None
-            
-            if msg.text.startswith("METADATA_V1"):
-                json_str = msg.text.split("\n", 1)[1]
-                metadata = MetadataManager.from_json(json_str)
-            elif msg.text.startswith("METADATA_V2_ENCRYPTED"):
-                if not passcode: return {"error": "Passcode required"}
-                try:
-                    encrypted_str = msg.text.split("\n", 1)[1]
-                    metadata = MetadataManager.from_json_encrypted(encrypted_str, passcode)
-                except: return {"error": "Decryption failed"}
-            
-            if not metadata: return {"error": "Invalid metadata"}
-            
-            chunk_ids = [c.message_id for c in metadata.chunks]
-            await tg_client.delete_messages(chunk_ids)
-            await tg_client.delete_messages([metadata_message_id])
-            return {"success": True}
-        return self._run_async(_delete())
+        return self.files.delete_file(file_id, metadata_message_id)
