@@ -42,6 +42,13 @@ export const downloadFile = (fileId) => call('download_file', fileId);
 export const renameFile = (fileId, newName, metadataMessageId) => call('rename_file', fileId, newName, metadataMessageId);
 export const deleteFile = (fileId, metadataMessageId) => call('delete_file', fileId, metadataMessageId);
 
+// Passcode Management
+export const hasPasscode = () => call('has_passcode');
+export const setPasscode = (passcode) => call('set_passcode', passcode);
+export const verifyPasscode = (passcode) => call('verify_passcode', passcode);
+export const changePasscode = (oldPasscode, newPasscode) => call('change_passcode', oldPasscode, newPasscode);
+export const resetEncryption = () => call('reset_encryption');
+
 // Listeners for progress (exposed to window by Bridge)
 // window.onUploadProgress = (fileId, progress, status) => ...
 // window.onDownloadProgress = (fileId, progress) => ...

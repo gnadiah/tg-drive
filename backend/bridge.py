@@ -12,6 +12,10 @@ import time
 class Bridge:
     def __init__(self):
         self._window = None
+        # Passcode rate limiting
+        self._failed_passcode_attempts = 0
+        self._passcode_lockout_until = None
+        self._session_passcode = None
         # Start a background event loop
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=self._start_loop, daemon=True)
@@ -126,6 +130,11 @@ class Bridge:
                 if hasattr(self, '_qr_error'): del self._qr_error
                 if hasattr(self, '_qr_needs_password'): del self._qr_needs_password
                 
+                # Clear Passcode state
+                if hasattr(self, '_session_passcode'): del self._session_passcode
+                self._failed_passcode_attempts = 0
+                self._passcode_lockout_until = None
+                
                 print("Bridge: logout successful")
                 return {"success": True}
             except Exception as e:
@@ -143,6 +152,159 @@ class Bridge:
     def log(self, message):
         """Log message from JS."""
         print(f"JS_LOG: {message}")
+
+    # --- Passcode Management ---
+    
+    def has_passcode(self):
+        """Check if passcode exists on Telegram."""
+        async def _has():
+            await self._ensure_client()
+            from backend.core.passcode_manager import has_passcode_on_telegram
+            return {"has_passcode": await has_passcode_on_telegram(tg_client.client)}
+        return self._run_async(_has())
+    
+    def set_passcode(self, passcode):
+        """
+        Set new passcode (first time setup).
+        Encrypts passcode with itself and stores on Telegram.
+        """
+        async def _set():
+            await self._ensure_client()
+            from backend.core.passcode_manager import set_passcode_on_telegram
+            from backend.core.crypto_utils import validate_passcode
+            
+            if not validate_passcode(passcode):
+                return {"success": False, "error": "Passcode must be exactly 6 digits"}
+            
+            try:
+                await set_passcode_on_telegram(tg_client.client, passcode)
+                # Cache in session for immediate use
+                self._session_passcode = passcode
+                return {"success": True}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+        return self._run_async(_set())
+    
+    def verify_passcode(self, passcode):
+        """
+        Verify passcode with rate limiting (5 attempts, 30s lockout).
+        """
+        # Check if locked out
+        if self._passcode_lockout_until and time.time() < self._passcode_lockout_until:
+            retry_after = int(self._passcode_lockout_until - time.time())
+            return {
+                "valid": False,
+                "error": "locked_out",
+                "message": f"Too many failed attempts. Try again in {retry_after}s",
+                "retry_after": retry_after
+            }
+        
+        async def _verify():
+            await self._ensure_client()
+            from backend.core.passcode_manager import verify_passcode_from_telegram
+            
+            valid = await verify_passcode_from_telegram(tg_client.client, passcode)
+            
+            if valid:
+                # Success - reset attempts and cache passcode
+                self._failed_passcode_attempts = 0
+                self._passcode_lockout_until = None
+                self._session_passcode = passcode
+                return {"valid": True}
+            else:
+                # Failed - increment attempts
+                self._failed_passcode_attempts += 1
+                attempts_remaining = 5 - self._failed_passcode_attempts
+                
+                if self._failed_passcode_attempts >= 5:
+                    # Lock out for 30 seconds
+                    self._passcode_lockout_until = time.time() + 30
+                    return {
+                        "valid": False,
+                        "error": "too_many_attempts",
+                        "message": "Too many failed attempts. Locked for 30 seconds",
+                        "locked_for": 30,
+                        "attempts_remaining": 0
+                    }
+                else:
+                    return {
+                        "valid": False,
+                        "error": "incorrect",
+                        "message": f"Incorrect passcode. {attempts_remaining} attempts remaining",
+                        "attempts_remaining": attempts_remaining
+                    }
+        
+        return self._run_async(_verify())
+    
+    def change_passcode(self, old_passcode, new_passcode):
+        """Change passcode after verifying old one."""
+        async def _change():
+            await self._ensure_client()
+            from backend.core.passcode_manager import change_passcode_on_telegram
+            from backend.core.crypto_utils import validate_passcode
+            if not validate_passcode(new_passcode):
+                return {"error": "New passcode must be exactly 6 digits"}
+            
+            try:
+                success = await change_passcode_on_telegram(tg_client.client, old_passcode, new_passcode)
+                if success:
+                    # Update session cache
+                    self._session_passcode = new_passcode
+                    
+                    # Re-encrypt all V2 metadata messages
+                    try:
+                        from backend.core.metadata_manager import MetadataManager
+                        print("Bridge: Starting metadata re-encryption...")
+                        count = 0
+                        async for msg in tg_client.client.iter_messages("me"):
+                            if msg.text and msg.text.startswith("METADATA_V2_ENCRYPTED"):
+                                try:
+                                    encrypted_str = msg.text.split("\n", 1)[1]
+                                    # Decrypt with OLD passcode
+                                    metadata = MetadataManager.from_json_encrypted(encrypted_str, old_passcode)
+                                    
+                                    # Re-encrypt with NEW passcode
+                                    new_content = MetadataManager.to_json_encrypted(metadata, new_passcode)
+                                    
+                                    # Edit message
+                                    await msg.edit(f"METADATA_V2_ENCRYPTED\n{new_content}")
+                                    count += 1
+                                except Exception as e:
+                                    print(f"Bridge: Failed to re-encrypt message {msg.id}: {e}")
+                        print(f"Bridge: Re-encryption complete. Processed {count} files.")
+                    except Exception as e:
+                        print(f"Bridge: Critical error during re-encryption: {e}")
+                    
+                    return {"success": True}
+                else:
+                    return {"error": "Incorrect old passcode"}
+            except ValueError as e:
+                return {"error": str(e)}
+        return self._run_async(_change())
+    
+    def reset_encryption(self):
+        """
+        NUCLEAR OPTION: Delete all encrypted data and start fresh.
+        Deletes: passcode hash + all V2 encrypted metadata
+        Keeps: V1 plaintext metadata
+        """
+        async def _reset():
+            await self._ensure_client()
+            from backend.core.passcode_manager import reset_all_encrypted_data
+            result = await reset_all_encrypted_data(tg_client.client)
+            
+            # Clear session cache and rate limiting
+            if hasattr(self, '_session_passcode'):
+                del self._session_passcode
+            self._failed_passcode_attempts = 0
+            self._passcode_lockout_until = None
+            
+            return {
+                "success": True,
+                "passcode_deleted": result["passcode_deleted"],
+                "encrypted_files_deleted": result["encrypted_files_deleted"]
+            }
+        return self._run_async(_reset())
 
     # --- QR Login ---
     
@@ -299,22 +461,53 @@ class Bridge:
             await self._ensure_client()
             messages = await tg_client.get_messages(limit=100)
             files = []
+            # Get active passcode
+            passcode = getattr(self, '_session_passcode', None)
+            
             for msg in messages:
-                if msg.text and msg.text.startswith("METADATA_V1"):
-                    try:
+                if not msg.text: continue
+                
+                try:
+                    metadata = None
+                    
+                    # Handle V1 (Plaintext)
+                    if msg.text.startswith("METADATA_V1"):
                         json_str = msg.text.split("\n", 1)[1]
                         metadata = MetadataManager.from_json(json_str)
+                        
+                    # Handle V2 (Encrypted)
+                    elif msg.text.startswith("METADATA_V2_ENCRYPTED"):
+                        if passcode:
+                            try:
+                                encrypted_str = msg.text.split("\n", 1)[1]
+                                metadata = MetadataManager.from_json_encrypted(encrypted_str, passcode)
+                            except Exception as e:
+                                print(f"Bridge: Failed to decrypt file {msg.id}: {e}")
+                                continue
+                        else:
+                            # Cannot decrypt without passcode
+                            continue
+                    
+                    if metadata:
                         file_data = metadata.model_dump()
                         file_data["metadata_message_id"] = msg.id
                         files.append(file_data)
-                    except Exception:
-                        continue
+                        
+                except Exception as e:
+                    print(f"Bridge: Error parsing message {msg.id}: {e}")
+                    continue
             return files
         return self._run_async(_list())
 
     def pick_and_upload_file(self):
         file_types = ('All files (*.*)',)
-        result = self._window.create_file_dialog(dialog_type=webview.windows.FileDialog.OPEN, allow_multiple=False, file_types=file_types)
+        # Handle window as list  
+        window = self._window[0] if isinstance(self._window, list) else self._window
+        result = window.create_file_dialog(
+            webview.FileDialog.OPEN,
+            allow_multiple=False,
+            file_types=file_types
+        )
         
         if result:
             file_path = result[0]
@@ -364,9 +557,11 @@ class Bridge:
                     tracker.update(index, current, total)
 
                 # Upload
+                passcode = getattr(self, '_session_passcode', None)
+                caption = "#ENCRYPTED_CHUNK" if passcode else "#TG_DRIVE_CHUNK"
                 message = await tg_client.upload_file(
                     chunk_temp_path, 
-                    caption=f"chunk_{index}_{file_id}",
+                    caption=caption,
                     progress_callback=progress_callback
                 )
                 print(f"Bridge: [Upload] Chunk {index} uploaded. Message ID: {message.id}")
@@ -406,9 +601,19 @@ class Bridge:
                 mime_type="application/octet-stream"
             )
             
-            metadata_json = MetadataManager.to_json(metadata)
-            await tg_client.send_message(f"METADATA_V1\n{metadata_json}")
-            print(f"Bridge: [Upload] Metadata sent. Upload complete.")
+            # Check for active passcode in session
+            passcode = getattr(self, '_session_passcode', None)
+            
+            if passcode:
+                # Encrypt metadata (V2)
+                metadata_encrypted = MetadataManager.to_json_encrypted(metadata, passcode)
+                await tg_client.send_message(f"METADATA_V2_ENCRYPTED\n{metadata_encrypted}")
+                print(f"Bridge: [Upload] Encrypted metadata (V2) sent.")
+            else:
+                # Plaintext metadata (V1)
+                metadata_json = MetadataManager.to_json(metadata)
+                await tg_client.send_message(f"METADATA_V1\n{metadata_json}")
+                print(f"Bridge: [Upload] Plaintext metadata (V1) sent.")
             
             self._window.evaluate_js(f"window.onUploadComplete('{file_id}')")
             
@@ -427,21 +632,42 @@ class Bridge:
             
             messages = await tg_client.get_messages(limit=100)
             metadata = None
+            passcode = getattr(self, '_session_passcode', None)
+            
             for msg in messages:
-                if msg.text and msg.text.startswith("METADATA_V1"):
-                    try:
+                if not msg.text: continue
+                
+                try:
+                    # Handle V1
+                    if msg.text.startswith("METADATA_V1"):
                         json_str = msg.text.split("\n", 1)[1]
                         m = MetadataManager.from_json(json_str)
                         if m.id == file_id:
                             metadata = m
                             break
-                    except: continue
+                            
+                    # Handle V2
+                    elif msg.text.startswith("METADATA_V2_ENCRYPTED"):
+                        if passcode:
+                            try:
+                                encrypted_str = msg.text.split("\n", 1)[1]
+                                m = MetadataManager.from_json_encrypted(encrypted_str, passcode)
+                                if m.id == file_id:
+                                    metadata = m
+                                    break
+                            except: continue
+                except: continue
             
             if not metadata:
                 self._window.evaluate_js(f"window.onDownloadError('{file_id}', 'File not found')")
                 return
 
-            save_path = self._window.create_file_dialog(dialog_type=webview.windows.FileDialog.SAVE, save_filename=metadata.name)
+            # Handle window as list
+            window = self._window[0] if isinstance(self._window, list) else self._window
+            save_path = window.create_file_dialog(
+                webview.FileDialog.SAVE,
+                save_filename=metadata.name
+            )
             
             if not save_path:
                 return
@@ -522,14 +748,34 @@ class Bridge:
             msgs = await tg_client.get_message_by_id(metadata_message_id)
             if not msgs: return {"error": "Message not found"}
             msg = msgs[0]
+            passcode = getattr(self, '_session_passcode', None)
             
-            json_str = msg.text.split("\n", 1)[1]
-            metadata = MetadataManager.from_json(json_str)
+            metadata = None
+            is_encrypted = False
+            
+            if msg.text.startswith("METADATA_V1"):
+                json_str = msg.text.split("\n", 1)[1]
+                metadata = MetadataManager.from_json(json_str)
+            elif msg.text.startswith("METADATA_V2_ENCRYPTED"):
+                if not passcode: return {"error": "Passcode required"}
+                try:
+                    encrypted_str = msg.text.split("\n", 1)[1]
+                    metadata = MetadataManager.from_json_encrypted(encrypted_str, passcode)
+                    is_encrypted = True
+                except: return {"error": "Decryption failed"}
+            
+            if not metadata: return {"error": "Invalid metadata"}
             if metadata.id != file_id: return {"error": "ID mismatch"}
             
             metadata.name = new_name
-            new_json = MetadataManager.to_json(metadata)
-            await tg_client.edit_message(metadata_message_id, f"METADATA_V1\n{new_json}")
+            
+            if is_encrypted:
+                new_content = MetadataManager.to_json_encrypted(metadata, passcode)
+                await tg_client.edit_message(metadata_message_id, f"METADATA_V2_ENCRYPTED\n{new_content}")
+            else:
+                new_json = MetadataManager.to_json(metadata)
+                await tg_client.edit_message(metadata_message_id, f"METADATA_V1\n{new_json}")
+            
             return {"success": True}
         return self._run_async(_rename())
 
@@ -539,9 +785,21 @@ class Bridge:
             msgs = await tg_client.get_message_by_id(metadata_message_id)
             if not msgs: return {"error": "Message not found"}
             msg = msgs[0]
+            passcode = getattr(self, '_session_passcode', None)
             
-            json_str = msg.text.split("\n", 1)[1]
-            metadata = MetadataManager.from_json(json_str)
+            metadata = None
+            
+            if msg.text.startswith("METADATA_V1"):
+                json_str = msg.text.split("\n", 1)[1]
+                metadata = MetadataManager.from_json(json_str)
+            elif msg.text.startswith("METADATA_V2_ENCRYPTED"):
+                if not passcode: return {"error": "Passcode required"}
+                try:
+                    encrypted_str = msg.text.split("\n", 1)[1]
+                    metadata = MetadataManager.from_json_encrypted(encrypted_str, passcode)
+                except: return {"error": "Decryption failed"}
+            
+            if not metadata: return {"error": "Invalid metadata"}
             
             chunk_ids = [c.message_id for c in metadata.chunks]
             await tg_client.delete_messages(chunk_ids)

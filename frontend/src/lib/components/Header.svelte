@@ -1,5 +1,5 @@
 <script>
-    import { Search, User, LogOut } from "lucide-svelte";
+    import { Search, User, LogOut, Lock } from "lucide-svelte";
     import { createEventDispatcher } from "svelte";
 
     const dispatch = createEventDispatcher();
@@ -58,6 +58,14 @@
             <div
                 class="absolute right-0 mt-2 w-48 bg-background border border-border rounded-[var(--radius-md)] shadow-lg py-1 z-[100]"
             >
+                <button
+                    on:click={() => dispatch("changePasscode")}
+                    class="w-full flex items-center gap-3 px-4 py-2 text-sm hover:bg-secondary transition-colors"
+                >
+                    <Lock size={16} />
+                    Change Passcode
+                </button>
+                <div class="h-px bg-border my-1"></div>
                 <button
                     on:click={() => dispatch("logout")}
                     class="w-full flex items-center gap-3 px-4 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
