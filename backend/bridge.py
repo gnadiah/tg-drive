@@ -314,7 +314,7 @@ class Bridge:
 
     def pick_and_upload_file(self):
         file_types = ('All files (*.*)',)
-        result = self._window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=False, file_types=file_types)
+        result = self._window.create_file_dialog(dialog_type=webview.windows.FileDialog.OPEN, allow_multiple=False, file_types=file_types)
         
         if result:
             file_path = result[0]
@@ -441,7 +441,7 @@ class Bridge:
                 self._window.evaluate_js(f"window.onDownloadError('{file_id}', 'File not found')")
                 return
 
-            save_path = self._window.create_file_dialog(webview.SAVE_DIALOG, save_filename=metadata.name)
+            save_path = self._window.create_file_dialog(dialog_type=webview.windows.FileDialog.SAVE, save_filename=metadata.name)
             
             if not save_path:
                 return

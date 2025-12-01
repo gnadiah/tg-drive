@@ -1,7 +1,6 @@
 ﻿# PyInstaller build files
 build/
 dist/
-*.spec
 
 # Telegram session files
 *.session
@@ -434,3 +433,4 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+installer_output/
