@@ -7,8 +7,8 @@ from pathlib import Path
 
 load_dotenv()
 
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
+API_ID = 30745743
+API_HASH = "f5e14f114b4b2d9fab6be2ab1afac826"
 
 # Store session in user's AppData directory for better compatibility
 def get_session_path():

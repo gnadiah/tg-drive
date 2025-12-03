@@ -1,5 +1,5 @@
 import { writable } from 'svelte/store';
-import { hasPasscode, verifyPasscode, setPasscode, resetEncryption } from '../lib/api';
+import { hasPasscode, verifyPasscode, setPasscode, resetEncryption, changePasscode } from '../lib/api';
 
 function createPasscodeStore() {
     const { subscribe, set, update } = writable({
@@ -151,7 +151,8 @@ function createPasscodeStore() {
             update(state => ({ ...state, isLoading: true, error: null }));
             try {
                 // API call
-                const { changePasscode } = await import('../lib/api');
+                // API call
+
                 const result = await changePasscode(oldPasscode, newPasscode);
 
                 if (result.success) {

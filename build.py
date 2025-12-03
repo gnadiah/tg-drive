@@ -82,22 +82,99 @@ def create_readme():
     """Create README for distribution"""
     print("\n=== Creating Distribution README ===")
     
+#!/usr/bin/env python3
+"""
+Build script for TG-Drive executable
+Automates the process of building the frontend and packaging the Python app
+"""
+import os
+import sys
+import subprocess
+import shutil
+from pathlib import Path
+
+def run_command(cmd, cwd=None):
+    """Run a command and print output"""
+    print(f"\n>>> Running: {cmd}")
+    result = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout)
+    if result.returncode != 0:
+        print(f"ERROR: {result.stderr}")
+        return False
+    return True
+
+def check_frontend_built():
+    """Check if frontend is built"""
+    dist_path = Path("frontend/dist/index.html")
+    return dist_path.exists()
+
+def build_frontend():
+    """Build the frontend using npm"""
+    print("\n=== Building Frontend ===")
+    frontend_dir = Path("frontend")
+    
+    if not frontend_dir.exists():
+        print("ERROR: Frontend directory not found!")
+        return False
+    
+    # Check if node_modules exists
+    if not (frontend_dir / "node_modules").exists():
+        print("Installing frontend dependencies...")
+        if not run_command("npm install", cwd=str(frontend_dir)):
+            return False
+    
+    # Build frontend
+    print("Building frontend...")
+    if not run_command("npm run build", cwd=str(frontend_dir)):
+        return False
+    
+    # Verify build output
+    if not check_frontend_built():
+        print("ERROR: Frontend build failed - dist/index.html not found!")
+        return False
+    
+    print("✓ Frontend built successfully")
+    return True
+
+def install_python_deps():
+    """Install Python dependencies"""
+    print("\n=== Installing Python Dependencies ===")
+    if not run_command(f"{sys.executable} -m pip install -r requirements.txt"):
+        return False
+    print("✓ Python dependencies installed")
+    return True
+
+def build_exe():
+    """Build the executable using PyInstaller"""
+    print("\n=== Building Executable ===")
+    
+    # Clean previous builds
+    for path in ["build", "dist"]:
+        if Path(path).exists():
+            print(f"Cleaning {path}/...")
+            shutil.rmtree(path)
+    
+    # Run PyInstaller
+    if not run_command("pyinstaller tg-drive.spec"):
+        return False
+    
+    print("✓ Executable built successfully")
+    return True
+
+def create_readme():
+    """Create README for distribution"""
+    print("\n=== Creating Distribution README ===")
+    
     readme_content = """TELEGRAM DRIVE - Desktop Application
 =====================================
 
 SETUP INSTRUCTIONS
 ------------------
 
-1. Create a .env file in the same directory as this executable with the following content:
+1. Double-click TelegramDrive.exe to run the application
 
-   API_ID=your_api_id
-   API_HASH=your_api_hash
-
-   You can obtain these from: https://my.telegram.org/apps
-
-2. Double-click TelegramDrive.exe to run the application
-
-3. Login using phone number or QR code
+2. Login using phone number or QR code
 
 
 DATA STORAGE
@@ -111,7 +188,6 @@ TROUBLESHOOTING
 ---------------
 
 - If antivirus blocks the exe, add it to exclusions
-- If login fails, check your .env file has correct API credentials
 - Session files are in AppData/Local/TelegramDrive
 
 
@@ -127,10 +203,7 @@ For issues, please check the project repository
         readme_path.write_text(readme_content, encoding='utf-8')
         print(f"✓ Created {readme_path}")
         
-        # Create example .env file
-        env_example = dist_dir / ".env.example"
-        env_example.write_text("API_ID=your_api_id_here\nAPI_HASH=your_api_hash_here\n", encoding='utf-8')
-        print(f"✓ Created {env_example}")
+
     
     return True
 
@@ -173,8 +246,7 @@ def main():
     print(f"\nExecutable location: dist/TelegramDrive/TelegramDrive.exe")
     print("\nNext steps:")
     print("1. Copy dist/TelegramDrive folder to your desired location")
-    print("2. Create a .env file with your API credentials")
-    print("3. Run TelegramDrive.exe")
+    print("2. Run TelegramDrive.exe")
     print("\n" + "=" * 60)
     
     return 0

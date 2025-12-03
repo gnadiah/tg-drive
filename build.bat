@@ -92,8 +92,7 @@ echo Executable location: dist\TelegramDrive\TelegramDrive.exe
 echo.
 echo Next steps:
 echo 1. Copy dist\TelegramDrive folder to your desired location
-echo 2. Create a .env file with your API credentials
-echo 3. Run TelegramDrive.exe
+echo 2. Run TelegramDrive.exe
 echo.
 echo ============================================================
 

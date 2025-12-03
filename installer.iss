@@ -49,7 +49,7 @@ Source: "dist\TelegramDrive\*"; DestDir: "{app}"; Flags: ignoreversion recursesu
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 ; Optional files - won't fail if missing
-Source: "dist\TelegramDrive\.env.example"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+
 Source: "dist\TelegramDrive\README.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme skipifsourcedoesntexist
 
 [Icons]
@@ -65,45 +65,8 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 ; Clean up session files and temp folders on uninstall
 Type: filesandordirs; Name: "{app}\temp_uploads"
 Type: filesandordirs; Name: "{app}\temp_download_*"
-; Note: We don't delete .env as it contains user's API keys
-; User should manually delete if needed
 
 [Code]
-var
-  EnvPage: TInputFileWizardPage;
-  ApiIdPage: TInputQueryWizardPage;
-
-procedure InitializeWizard;
-begin
-  // Create a page for API credentials input (optional)
-  ApiIdPage := CreateInputQueryPage(wpSelectDir,
-    'Telegram API Credentials (Optional)',
-    'Enter your Telegram API credentials',
-    'You can get these from https://my.telegram.org/apps. You can skip this and create a .env file manually later.');
-  
-  ApiIdPage.Add('API ID:', False);
-  ApiIdPage.Add('API HASH:', False);
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-var
-  EnvFilePath: String;
-  EnvContent: TArrayOfString;
-begin
-  if CurStep = ssPostInstall then
-  begin
-    // If user provided API credentials, create .env file
-    if (ApiIdPage.Values[0] <> '') and (ApiIdPage.Values[1] <> '') then
-    begin
-      EnvFilePath := ExpandConstant('{app}\.env');
-      SetArrayLength(EnvContent, 2);
-      EnvContent[0] := 'API_ID=' + ApiIdPage.Values[0];
-      EnvContent[1] := 'API_HASH=' + ApiIdPage.Values[1];
-      SaveStringsToFile(EnvFilePath, EnvContent, False);
-    end;
-  end;
-end;
-
 function InitializeUninstall(): Boolean;
 begin
   Result := True;
